@@ -30,10 +30,100 @@ function enhance(canvas){
 }
 function extract(text){const lines=text.split(/\r?\n/);let out=[];for(const line of lines){const cleaned=line.trim();if(!cleaned)continue; // Reject dates, long IDs, decimal values; accept isolated 4 digit groups only.
 const matches=[...cleaned.matchAll(/(?<!\d)\d{4}(?!\d)/g)];for(const m of matches)out.push(m[0]);}return out}
-$('scan').onclick=async()=>{if(state.busy)return;if(!state.photos.length){alert('先に写真を選択してください');return}if(!window.Tesseract){alert('OCRライブラリを読み込めません。インターネット接続を確認してください');return}state.busy=true;$('scan').disabled=true;$('progress').classList.remove('hidden');let worker;const pending=state.photos.splice(0);showPhotos();try{status('OCRエンジンを準備しています…');worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')$('progress').value=Math.round(m.progress*100)}});await worker.setParameters({tessedit_char_whitelist:'0123456789',preserve_interword_spaces:'1'});for(let i=0;i<pending.length;i++){const file=pending[i];status(`${i+1}/${pending.length}枚目: ${file.name}`);try{const canvas=await cropped(file);let {data}=await worker.recognize(enhance(canvas));let found=extract(data.text);
- if(!found.length){const raw=data.text;({data}=await worker.recognize(canvas));found=extract(data.text);$('ocrDebug').value+=`\n[${file.name} / 補正画像]\n${raw}\n[通常画像]\n${data.text}\n`}
- else {$('ocrDebug').value+=`\n[${file.name}]\n${data.text}\n`}
-for(const number of found)state.entries.push({number,source:file.name});state.processed++;status(`${i+1}/${pending.length}枚処理済み。今回 ${found.length}件認識`);render();if(!found.length)alert(`${file.name}: 4桁の数字を検出できませんでした。切り出し画像とOCR診断情報を確認してください`)}catch(err){state.photos.push(file);status(`${file.name}: ${err.message}`)}}}catch(err){state.photos.push(...pending.slice(state.processed));status('OCRの初期化に失敗: '+err.message)}finally{if(worker)await worker.terminate();state.busy=false;$('scan').disabled=false;$('progress').classList.add('hidden');showPhotos();render()}};
+// Detect full-width horizontal separators using pixels near the two edges of the crop.
+// These edge strips exclude the centered four-digit numbers.
+function findRows(canvas){
+ const w=canvas.width,h=canvas.height,ctx=canvas.getContext('2d',{willReadFrequently:true});
+ const d=ctx.getImageData(0,0,w,h).data;
+ const gray=(x,y)=>{let i=(y*w+x)*4;return .299*d[i]+.587*d[i+1]+.114*d[i+2]};
+ const score=[];
+ for(let y=0;y<h;y++){
+  let sum=0,n=0;
+  for(let x=Math.floor(w*.04);x<Math.floor(w*.26);x+=2){sum+=gray(x,y);n++}
+  for(let x=Math.floor(w*.74);x<Math.floor(w*.96);x+=2){sum+=gray(x,y);n++}
+  score.push(sum/Math.max(1,n));
+ }
+ const smooth=score.map((v,y)=>{let t=0,n=0;for(let k=-1;k<=1;k++){if(y+k>=0&&y+k<h){t+=score[y+k];n++}}return t/n});
+ const baseline=[...smooth].sort((a,b)=>a-b)[Math.floor(h*.65)];
+ const threshold=Math.min(baseline-13, [...smooth].sort((a,b)=>a-b)[Math.floor(h*.12)]+12);
+ const groups=[];let start=-1;
+ for(let y=0;y<=h;y++){
+  const dark=y<h&&smooth[y]<threshold;
+  if(dark&&start<0)start=y;
+  if(!dark&&start>=0){if(y-start<=Math.max(10,h*.012))groups.push(Math.floor((start+y-1)/2));start=-1}
+ }
+ // Combine adjacent detections from a thick/double line.
+ const merged=[];for(const y of groups){if(!merged.length||y-merged[merged.length-1]>Math.max(5,h*.004))merged.push(y);else merged[merged.length-1]=Math.round((merged[merged.length-1]+y)/2)}
+ const diffs=merged.slice(1).map((v,i)=>v-merged[i]).filter(v=>v>h*.012);
+ const typical=diffs.length?[...diffs].sort((a,b)=>a-b)[Math.floor(diffs.length/2)]:0;
+ if(!typical||merged.length<5)return [];
+ const rows=[];
+ for(let i=0;i<merged.length-1;i++){
+  const a=merged[i],b=merged[i+1],gap=b-a;
+  if(gap<typical*.62||gap>typical*1.55)continue;
+  rows.push([Math.max(0,a+Math.max(2,Math.floor(gap*.10))),Math.min(h,b-Math.max(2,Math.floor(gap*.10)))]);
+ }
+ return rows;
+}
+function rowImage(canvas,range){
+ const [a,b]=range,w=canvas.width,h=b-a;
+ const out=document.createElement('canvas');
+ // Tight crop to the center of the original column, then enlarge with interpolation.
+ const sx=Math.floor(w*.12),sw=Math.floor(w*.76),factor=Math.max(3,Math.min(6,Math.floor(450/sw)));
+ out.width=sw*factor;out.height=Math.max(1,h*factor);
+ const ctx=out.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,out.width,out.height);
+ ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';ctx.drawImage(canvas,sx,a,sw,h,0,0,out.width,out.height);
+ return out;
+}
+async function recognizeRows(worker,canvas,file){
+ const rows=findRows(canvas);
+ $('ocrDebug').value+=`\n[${file} / 横線検出] ${rows.length}行\n`;
+ if(rows.length<3)return {found:[],rows:0};
+ await worker.setParameters({tessedit_pageseg_mode:'7',tessedit_char_whitelist:'0123456789',user_defined_dpi:'300'});
+ const found=[];let failed=0;
+ for(let i=0;i<rows.length;i++){
+  const im=rowImage(canvas,rows[i]);
+  const result=await worker.recognize(im);
+  const raw=result.data.text.trim();
+  const digits=raw.replace(/\s/g,'');
+  if(/^\d{4}$/.test(digits))found.push(digits);
+  else {failed++;$('ocrDebug').value+=`行${i+1}: ${JSON.stringify(raw)} (未確定)\n`}
+  $('progress').value=Math.round((i+1)/rows.length*100);
+ }
+ $('ocrDebug').value+=`認識成功 ${found.length} / ${rows.length}行、未確定 ${failed}行\n`;
+ return {found,rows:rows.length,failed};
+}
+$('scan').onclick=async()=>{
+ if(state.busy)return;
+ if(!state.photos.length){alert('先に写真を選択してください');return}
+ if(!window.Tesseract){alert('OCRライブラリを読み込めません。通信状態を確認してください');return}
+ state.busy=true;$('scan').disabled=true;$('progress').classList.remove('hidden');
+ let worker;const pending=state.photos.splice(0);showPhotos();
+ try{
+  status('OCRエンジンを準備しています…');
+  worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')$('progress').value=Math.round(m.progress*100)}});
+  for(let i=0;i<pending.length;i++){
+   const file=pending[i];status(`${i+1}/${pending.length}枚目: ${file.name}`);
+   try{
+    const canvas=await cropped(file);
+    let result=await recognizeRows(worker,canvas,file.name);
+    let found=result.found;
+    if(result.rows<3){
+     $('ocrDebug').value+=`横線検出が不十分なため通常OCRを試行\n`;
+     await worker.setParameters({tessedit_pageseg_mode:'6',tessedit_char_whitelist:'0123456789'});
+     const whole=await worker.recognize(canvas);found=extract(whole.data.text);
+     $('ocrDebug').value+=`[通常OCR]\n${whole.data.text}\n`;
+    }
+    for(const number of found)state.entries.push({number,source:file.name});
+    state.processed++;render();
+    const warning=result.rows>=3?`（${result.rows}行検出。未確定 ${result.failed}行）`:'';
+    status(`${i+1}/${pending.length}枚処理。${found.length}件抽出 ${warning}`);
+    if(!found.length||result.failed>0)alert(`${file.name}: ${found.length}件認識 ${warning}。読み落としや誤認識の可能性があります。写真と照合してください。`);
+   }catch(err){state.photos.push(file);status(`${file.name}: ${err.message}`)}
+  }
+ }catch(err){state.photos.push(...pending.filter(f=>!state.photos.includes(f)));status('OCR初期化に失敗: '+err.message)}
+ finally{if(worker)await worker.terminate();state.busy=false;$('scan').disabled=false;$('progress').classList.add('hidden');showPhotos();render()}
+};
 $('add').onclick=()=>{const n=normalize($('newNumber').value);if(!valid(n)){alert('受付番号は4桁の数字で入力してください');return}state.entries.push({number:n,source:'手動追加'});$('newNumber').value='';render()};
 $('reset').onclick=()=>{if(confirm('認識した番号をすべて削除しますか？')){state.entries=[];state.processed=0;render()}};
 function csv(){let numbers=[...new Set(state.entries.map(e=>e.number))];if($('sort').checked)numbers.sort((a,b)=>Number(a)-Number(b));return '\uFEFF受付No.\r\n'+numbers.map(n=>'"'+n+'"').join('\r\n')+'\r\n'}
